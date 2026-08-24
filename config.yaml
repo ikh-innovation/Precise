@@ -1,0 +1,208 @@
+pipeline:
+  default_image: samples/1.jpeg
+  view_type: facade
+  materials_all: true
+
+facade_parsing:
+  threshold: 0.6
+  backbone: samvit-l
+  crop_foreground: true
+  save_masks: false
+  prompts: [house, window, door]
+  prompt_synonyms:
+    house: [house, building]
+    window: [window, windowpane]
+    door: [door, doorway]
+  input_resize_short_side: 512
+  min_polygon_area_px: 50.0
+  poly_simplify_eps_ratio: 0.002
+  overlay_alpha: 0.1
+  label_colors_bgr:
+    house: [0, 0, 255]
+    window: [255, 0, 0]
+    door: [0, 255, 0]
+  model_version: v1.0
+
+building_features:
+  assumed_door_height_m: 2.05
+  assumed_floor_height_m: 3.2
+  window_cluster_tol_ratio: 0.6
+  plausible_floor_height_m: [2.4, 4.5]
+  bottom_door_tol_ratio: 0.15
+  model_version: v1.0
+
+building_materials:
+  # SigLIP2 ViT-L (384px) — strong fine-grained material/texture, ~1.6 GB,
+  # fits the 8 GB GPU alongside Module 1. Weights download from HF on first run.
+  # For max accuracy (and more VRAM) use ViT-SO400M-16-SigLIP2-384.
+  model_name: ViT-L-16-SigLIP2-384
+  pretrained: webli
+  model_id: siglip2-large-16-384
+  # Module 3 backend: siglip2 (zero-shot) | minc (MINC-trained) | facade (DINOv3 Facade-8)
+  material_backend: facade
+  minc_checkpoint: src/building_materials_minc/runs/best.pt
+  minc_arch: convnext_tiny
+  # DINOv3 Facade-8 backend (src/building_materials_facade): facade-domain model
+  # trained on MINC + OpenFACADES + URC + London/Scotland; adds concrete + render.
+  facade_checkpoint: src/building_materials_facade/runs/best.pt
+  facade_arch: vit_base_patch16_dinov3.lvd1689m
+  facade_patch_size: 256
+  facade_max_patches: 16
+  facade_min_wall_ratio: 0.7
+  per_object_min_size_px: 24
+  # Patch-voting (SigLIP2 backend)
+  patch_size: 384
+  max_patches: 12
+  min_patch_wall_ratio: 0.6
+  # Patch-voting (MINC backend): small, high-purity patches that fit the wall
+  # between windows; dilation keeps patches off window/door frames.
+  minc_patch_size: 128
+  minc_max_patches: 24
+  minc_min_wall_ratio: 0.9
+  wall_opening_dilation_ratio: 0.012
+  materials:
+    - brick
+    - concrete
+    - glass
+    - steel
+    - wood
+    - stone
+    - aluminum
+  prompt_templates:
+    facade:
+      - "a photo of a {label} building facade"
+      - "texture of a {label} wall"
+      - "close-up of {label} exterior wall"
+      - "architectural {label} surface"
+    topdown:
+      - "aerial view of a {label} roof"
+      - "top-down photo of a {label} building"
+      - "satellite view of {label} rooftop"
+      - "rooftop made of {label}"
+
+  # Fixed, representative mechanical properties looked up by material label.
+  # These are STATIC reference values (one representative figure per property
+  # for the grade in `note`); they are never computed at runtime, so a given
+  # material always reports the same numbers. Values are standard textbook /
+  # reference figures (Callister, Ashby/CES, Eurocode/AISC, Wood Handbook) and
+  # have NOT been freshly cross-checked against live online sources — verify
+  # against your preferred standard before using them for structural analysis.
+  # Keys MUST match entries in `materials` above.
+  #   density_kg_m3             bulk density (kg/m3)
+  #   youngs_modulus_gpa        modulus of elasticity (GPa)
+  #   compressive_strength_mpa  representative compressive strength (MPa)
+  #   tensile_strength_mpa      representative tensile strength (MPa)
+  #   poisson_ratio             Poisson's ratio (dimensionless)
+  material_properties:
+    brick:
+      category: masonry
+      density_kg_m3: 1920
+      youngs_modulus_gpa: 15
+      compressive_strength_mpa: 20
+      tensile_strength_mpa: 2.5
+      poisson_ratio: 0.15
+      note: fired clay common brick
+    concrete:
+      category: concrete
+      density_kg_m3: 2400
+      youngs_modulus_gpa: 30
+      compressive_strength_mpa: 30
+      tensile_strength_mpa: 3.0
+      poisson_ratio: 0.20
+      note: normal-weight C30/37
+    glass:
+      category: ceramic
+      density_kg_m3: 2500
+      youngs_modulus_gpa: 70
+      compressive_strength_mpa: 1000
+      tensile_strength_mpa: 45
+      poisson_ratio: 0.22
+      note: annealed soda-lime glass
+    steel:
+      category: metal
+      density_kg_m3: 7850
+      youngs_modulus_gpa: 200
+      compressive_strength_mpa: 250
+      tensile_strength_mpa: 400
+      poisson_ratio: 0.30
+      note: mild structural steel (S235 / A36)
+    wood:
+      category: wood
+      density_kg_m3: 500
+      youngs_modulus_gpa: 11
+      compressive_strength_mpa: 40
+      tensile_strength_mpa: 90
+      poisson_ratio: 0.35
+      note: softwood, clear, parallel to grain
+    stone:
+      category: natural-stone
+      density_kg_m3: 2650
+      youngs_modulus_gpa: 50
+      compressive_strength_mpa: 130
+      tensile_strength_mpa: 10
+      poisson_ratio: 0.25
+      note: granite (representative)
+    aluminum:
+      category: metal
+      density_kg_m3: 2700
+      youngs_modulus_gpa: 69
+      compressive_strength_mpa: 240
+      tensile_strength_mpa: 310
+      poisson_ratio: 0.33
+      note: 6061-T6 alloy
+    # --- extra entries used by the MINC material backend ---
+    metal:
+      category: metal
+      density_kg_m3: 7850
+      youngs_modulus_gpa: 200
+      compressive_strength_mpa: 250
+      tensile_strength_mpa: 400
+      poisson_ratio: 0.30
+      note: structural metal (steel-representative)
+    tile:
+      category: ceramic
+      density_kg_m3: 2300
+      youngs_modulus_gpa: 70
+      compressive_strength_mpa: 200
+      tensile_strength_mpa: 30
+      poisson_ratio: 0.22
+      note: ceramic / porcelain tile
+    painted:
+      category: masonry
+      density_kg_m3: 1900
+      youngs_modulus_gpa: 20
+      compressive_strength_mpa: 15
+      tensile_strength_mpa: 2.5
+      poisson_ratio: 0.20
+      note: painted render / plaster (approx)
+    # Facade-8 'render' class: cement/lime render, stucco, plaster coatings.
+    render:
+      category: masonry
+      density_kg_m3: 1800
+      youngs_modulus_gpa: 8
+      compressive_strength_mpa: 10
+      tensile_strength_mpa: 1.5
+      poisson_ratio: 0.20
+      note: cement/lime render (stucco / plaster)
+    plastic:
+      category: polymer
+      density_kg_m3: 1400
+      youngs_modulus_gpa: 3.0
+      compressive_strength_mpa: 55
+      tensile_strength_mpa: 48
+      poisson_ratio: 0.38
+      note: rigid PVC / plastic cladding
+
+# Optional Module 1 backend: the trained 12-class CMP SegFormer
+# (src/facade_parsing_segm/segformer_cmp). Used when client.py runs with
+# manual_seg=True. The 12 classes reduce to house(=facade)/window/door; overlay
+# colors come from facade_parsing.label_colors_bgr (parity with SEEM).
+facade_parsing_segformer:
+  checkpoint: src/facade_parsing_segm/segformer_cmp/runs/best
+  prob_threshold: 0.5
+  # Higher alpha so the full 12-class segmentation is legible (was 0.1, which
+  # was fine for the old 3-class overlay but too faint for all classes).
+  overlay_alpha: 0.4
+  min_polygon_area_px: 80.0
+  poly_simplify_eps_ratio: 0.01
+  model_version: v1.0

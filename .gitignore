@@ -1,0 +1,37 @@
+# --- Data & images (datasets, sample/base imagery, vendored code) ---
+base/
+samples/
+data/
+third_party/
+
+# --- Trained models / checkpoints / training outputs ---
+# Too large for git and reproducible via the train.py scripts.
+runs/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.bin
+
+# --- Pipeline outputs written next to input images ---
+*_pipeline.png
+m1.json
+m2.json
+m3.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp

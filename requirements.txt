@@ -1,0 +1,27 @@
+# Project-wide deps for modules 2 (building_features) and 3 (building_materials).
+# Pinned loosely so they coexist with SEEM's pins (Module 1).
+torch>=2.0
+open_clip_torch>=2.20
+opencv-python>=4.8
+numpy>=1.23
+Pillow>=9.4
+pydantic>=2.5
+PyYAML>=6.0
+rich>=13.0
+
+# Optional: SegFormer reproduction of the published 12-class CMP result
+# (src/facade_parsing_segm/segformer_cmp). Uses the HuggingFace Trainer recipe;
+# the nvidia/mit-b0 backbone is downloaded from the Hub on first run.
+transformers>=4.30
+accelerate>=0.20
+
+# -----------------------------------------------------------------------------
+# Module 1 (facade_parsing) wraps the upstream SEEM repo. Its extra deps
+# (torch==2.1.0 CPU build, custom detectron2 fork, mpi4py, whisper, ...) plus
+# the SEEM checkpoint are installed by:
+#
+#     bash src/facade_parsing/setup_seem.sh
+#
+# That script also installs THIS requirements.txt into the same env. After it
+# completes, the single `precise-seem` conda env runs all three modules.
+# -----------------------------------------------------------------------------
