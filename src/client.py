@@ -1,6 +1,9 @@
 """End-to-end Precise pipeline.
 
-Runs Modules 1–3 on a single image:
+Runs Modules 1–3 on a folder of paired top-down/facade **packages** (the
+default), or on plain facade images with `--images`.
+
+On a single image:
   * Module 1 — semantic masks for `house`/`facade`, `window`, `door`
                (SegFormer when manual_seg=True, else SEEM).
   * Module 2 — floor count + building height from those bboxes.
@@ -12,47 +15,83 @@ Outputs next to the input image (overwritten each run):
   * `m1.json`, `m2.json`, `m3.json` — pydantic dumps from each module.
   * `<stem>_pipeline.png`           — annotated visualization.
 
+**Package mode is the default.** It walks a folder where each building is a
+pair of images — `<id>.png` top-down and `Fac<id>.png` facade — showing both in
+one window while feeding the facade half to Modules 1–3. Only one pair is
+decoded at a time. The window shows nothing but the two images; package names,
+results and the key reference are printed here on the terminal.
+
 Usage (run with the GPU conda env — see README):
     PY=~/miniconda3/envs/precise-seem-gpu/bin/python
-    $PY src/client.py                      # every ./base/*.jpg
-    $PY src/client.py path/to/facade.jpg   # a single image
-    $PY src/client.py path/to/dir          # every .jpg in a directory
+    $PY src/client.py                      # browse data/Precise-Data  (default)
+    $PY src/client.py path/to/pairs        # a different package folder
+    $PY src/client.py --auto               # batch every pair
+    $PY src/client.py --show               # display only, no models loaded
+    $PY src/client.py --ids 3 7            # only these ids
+
+    keys:  d / right  next     a / left  previous
+           r          run Modules 1–3    q / esc  quit
+
+Image mode needs `--images`, except that a positional *file* selects it
+automatically (a file can never be a folder of pairs):
+
+    $PY src/client.py path/to/facade.jpg   # a single image (no flag needed)
+    $PY src/client.py --images             # every ./base/*.jpg
+    $PY src/client.py --images path/to/dir # every .jpg in a directory
 
 The Module 3 backend is selected by `building_materials.material_backend` in
 config.yaml (default: the DINOv3 Facade-8 model).
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
 from functools import wraps
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cv2
 import numpy as np
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
 
-from building_features import BuildingFeatures, Detection
-from building_materials import BuildingMaterials, MaterialProperties, ObjectMaterial
-from config import PreciseConfig, load_config
-from facade_parsing import (
-    BUILDING_LABELS,
-    OPENING_LABELS,
-    ClassMask,
-    FacadeParser,
-    ensure_backbone_assets,
+from building_packages import (
+    DEFAULT_OUT_ROOT,
+    DEFAULT_ROOT,
+    KEY_HELP,
+    KEY_HELP_VIEW_ONLY,
+    PackageCursor,
+    PackageWindow,
+    compose_package_view,
+    discover_packages,
+    iter_loaded,
+    pipeline_blockers,
+    run_package,
+    select,
 )
+from config import PreciseConfig, load_config
+
+# Modules 1-3 pull in torch, open_clip, transformers and rich at import time.
+# They are imported inside the methods that use them so that package browsing
+# (`--packages --show`) needs nothing but cv2/numpy — it loads no model and
+# renders no rich output, and must stay usable in an environment that cannot
+# run inference. `from __future__ import annotations` makes every annotation
+# below a string, so these names are only needed by a type checker.
+if TYPE_CHECKING:
+    from building_features import Detection
+    from building_materials import MaterialProperties, ObjectMaterial
+    from facade_parsing import ClassMask
 
 
 def timer(fn):
     """Decorator that prints wall-clock seconds taken by `fn`."""
     @wraps(fn)
     def wrapped(*args, **kwargs):
+        from rich.console import Console
+        from rich.panel import Panel
+
         console = Console()
         start = time.perf_counter()
         result = fn(*args, **kwargs)
@@ -78,6 +117,8 @@ class Pipeline:
             use_segformer: When True, Module 1 uses the trained CMP SegFormer
                 (`facade_parsing_segm/segformer_cmp`) instead of SEEM.
         """
+        from rich.console import Console
+
         self.cfg = cfg
         self.use_segformer = use_segformer
         self.console = Console()
@@ -97,6 +138,8 @@ class Pipeline:
 
     def _house_bbox(self, parse_result) -> tuple[float, float, float, float] | None:
         """Return the building bbox: `house` (SEEM) or `facade` (SegFormer)."""
+        from facade_parsing import BUILDING_LABELS
+
         for cls in parse_result.classes:
             if cls.label in BUILDING_LABELS and cls.bbox is not None:
                 x1, y1, x2, y2 = cls.bbox.pixel
@@ -111,6 +154,8 @@ class Pipeline:
         produced no facade/house — Module 3 then fails closed (reports "none")
         rather than classifying the whole image.
         """
+        from facade_parsing import BUILDING_LABELS, OPENING_LABELS
+
         building = np.zeros((height, width), dtype=np.uint8)
         openings = np.zeros((height, width), dtype=np.uint8)
         for cls in parse_result.classes:
@@ -232,6 +277,8 @@ class Pipeline:
         Args:
             props_by_material: Material label → its configured properties.
         """
+        from rich.table import Table
+
         if not props_by_material:
             return
         table = Table(
@@ -260,15 +307,23 @@ class Pipeline:
         self.console.print(table)
 
     @timer
-    def run(self, image: str | Path) -> Path:
+    def run(self, image: str | Path, out_dir: str | Path | None = None) -> Path:
         """Run Modules 1–3 on `image` and write JSON + annotated PNG outputs.
 
         Args:
             image: Path to the input facade image.
+            out_dir: Directory for `m1/m2/m3.json` and the annotated PNG,
+                created if missing. Defaults to the image's own directory —
+                pass a per-image directory when batching a folder, otherwise
+                every run overwrites the same three JSON files.
 
         Returns:
             Path to the annotated `<stem>_pipeline.png`.
         """
+        from rich.panel import Panel
+
+        from building_features import BuildingFeatures
+
         image_path = Path(image)
         m1 = "SegFormer" if self.use_segformer else "SEEM"
         m3 = {"minc": "MINC", "facade": "DINOv3 Facade-8"}.get(
@@ -299,6 +354,8 @@ class Pipeline:
                 )
                 parse_result = parser.parse()
         else:
+            from facade_parsing import FacadeParser, ensure_backbone_assets
+
             ensure_backbone_assets(self.cfg.facade_parsing.backbone)
             with self.console.status(
                 "[bold cyan]Module 1: SEEM semantic parsing...", spinner="dots"
@@ -349,6 +406,8 @@ class Pipeline:
                 view_type=self.cfg.pipeline.view_type,
             )
         else:
+            from building_materials import BuildingMaterials
+
             materials = BuildingMaterials(
                 image_path=image_path,
                 cfg=self.cfg.building_materials,
@@ -381,7 +440,8 @@ class Pipeline:
                 m3_result = materials.classify_instances(detections)
                 per_object_labels = m3_result.objects
 
-        json_dir = image_path.parent
+        json_dir = Path(out_dir) if out_dir is not None else image_path.parent
+        json_dir.mkdir(parents=True, exist_ok=True)
         self._write_json(json_dir / "m1.json", parse_result)
         self._write_json(json_dir / "m2.json", features)
         self._write_json(json_dir / "m3.json", m3_result)
@@ -404,7 +464,7 @@ class Pipeline:
                 approx = " ~approx" if m3_result.classified_region == "masked_bbox" else ""
                 lines.append(f"Material: {dom.label} ({dom.score * 100:.1f}%){approx}")
 
-        out_path = image_path.with_name(f"{image_path.stem}_pipeline.png")
+        out_path = json_dir / f"{image_path.stem}_pipeline.png"
         final = self._save_annotated(overlay, lines, per_object_labels, out_path)
 
         summary = [
@@ -440,7 +500,7 @@ class Pipeline:
 
 
 def main(img_path: str, materials_all=True, manual_seg: bool = True) -> None:
-    """Entry point: run the pipeline on a single image.
+    """Run the pipeline on a single image.
 
     Args:
         img_path: Path to the input facade image.
@@ -455,9 +515,160 @@ def main(img_path: str, materials_all=True, manual_seg: bool = True) -> None:
     Pipeline(cfg, use_segformer=manual_seg).run(image=img_path)
 
 
-if __name__ == "__main__":
-    # Run a single image, every .jpg in a directory, or (no arg) all of ./base.
-    target = sys.argv[1] if len(sys.argv) > 1 else "./base"
+# ---------------------------------------------------------------------------
+# Package mode: paired top-down / facade images from a `Precise-Data` folder
+# ---------------------------------------------------------------------------
+
+def _print_keys(can_run: bool) -> None:
+    """List the interactive keys on the terminal.
+
+    The window itself draws nothing but the two images, so the key reference
+    lives here rather than as an on-canvas legend. Plain `print` throughout
+    package mode: `rich` is a pipeline dependency, and browsing must not
+    require it.
+    """
+    for key, action in (KEY_HELP if can_run else KEY_HELP_VIEW_ONLY):
+        print(f"  {key:<10} {action}")
+
+
+def _report_blockers(cfg: PreciseConfig, use_segformer: bool) -> bool:
+    """Print why inference is unavailable, if it is.
+
+    Returns:
+        True when the pipeline looks runnable.
+    """
+    blockers = pipeline_blockers(cfg, use_segformer=use_segformer)
+    if not blockers:
+        return True
+    print("Pipeline unavailable - display only:")
+    for item in blockers:
+        print(f"  - {item}")
+    print("  (--show silences this)")
+    return False
+
+
+def _build_pipeline(
+    cfg: PreciseConfig, use_segformer: bool, materials_all: bool
+) -> Pipeline:
+    """Configure one `Pipeline` for a whole package run.
+
+    The caller's config is left untouched, and `view_type` is pinned to
+    `facade`: only the facade half of a package is ever analysed.
+    """
+    run_cfg = cfg.model_copy(deep=True)
+    run_cfg.pipeline.materials_all = materials_all
+    run_cfg.pipeline.view_type = "facade"
+    return Pipeline(run_cfg, use_segformer=use_segformer)
+
+
+def _packages_interactive(packages, cfg, args, can_run: bool) -> int:
+    """Browse packages in a window, running the pipeline on demand.
+
+    Returns:
+        Process exit code.
+    """
+    total = len(packages)
+    pipeline = _build_pipeline(cfg, not args.seem, not args.per_object) if can_run else None
+
+    with PackageCursor(packages) as cursor, PackageWindow() as window:
+        while True:
+            package = cursor.current
+            print(f"showing {package.name}  [{cursor.position + 1}/{total}]", flush=True)
+            action = window.wait_for_action(
+                compose_package_view(package, cell_size=(args.cell, args.cell))
+            )
+
+            if action == "quit":
+                return 0
+            if action == "next":
+                cursor.move(1)
+            elif action == "prev":
+                cursor.move(-1)
+            elif action == "unknown":
+                # Surfaced rather than ignored so a backend whose arrow codes
+                # differ from the ones we accept is diagnosable on the spot.
+                print(f"unrecognized key code {window.last_unknown_key}")
+                _print_keys(can_run)
+            elif action == "run":
+                if pipeline is None:
+                    print("pipeline unavailable in this environment")
+                    continue
+                result = run_package(package, pipeline, out_root=args.out_root)
+                print(result.summary(), flush=True)
+
+
+def _packages_auto(packages, cfg, args, can_run: bool) -> int:
+    """Walk every package once, running the pipeline and reporting a tally.
+
+    Returns:
+        Process exit code — non-zero when any package failed.
+    """
+    total = len(packages)
+    pipeline = _build_pipeline(cfg, not args.seem, not args.per_object) if can_run else None
+    window = None if args.no_window else PackageWindow()
+    failures = 0
+
+    try:
+        for position, package in enumerate(iter_loaded(packages)):
+            print(f"[{position + 1}/{total}] {package.name}", flush=True)
+            if pipeline is not None:
+                result = run_package(package, pipeline, out_root=args.out_root)
+                print(f"    {result.summary()}", flush=True)
+                failures += 0 if result.ok else 1
+
+            if window is not None:
+                canvas = compose_package_view(package, cell_size=(args.cell, args.cell))
+                # q / esc during the hold aborts the batch.
+                if window.is_quit(window.show(canvas, delay_ms=max(1, args.delay))):
+                    print("aborted by user")
+                    break
+    finally:
+        if window is not None:
+            window.close()
+
+    if pipeline is not None:
+        print(f"done: {total - failures}/{total} succeeded -> {args.out_root}")
+    return 1 if failures else 0
+
+
+def _run_packages(args: argparse.Namespace) -> int:
+    """Index a package folder, then browse or batch it.
+
+    This is the default mode: bare `python src/client.py` lands here on
+    `data/Precise-Data`.
+    """
+    # `--packages DIR` wins over a positional folder; neither given -> the
+    # default dataset. `discover_packages(None)` resolves to data/Precise-Data.
+    root = args.packages or args.target
+    index = discover_packages(root)
+    print(index.summary())
+    if not index.packages:
+        print("No <id>/Fac<id> image pairs found.")
+        return 1
+
+    packages = select(index, args.ids)
+    if args.list:
+        for package in packages:
+            print(
+                f"  {package.name}  top-down={package.topdown_path.name}"
+                f"  facade={package.facade_path.name}"
+            )
+        return 0
+
+    cfg = load_config()
+    can_run = False
+    if not args.show_only:
+        can_run = _report_blockers(cfg, use_segformer=not args.seem)
+
+    if not args.auto:
+        _print_keys(can_run)
+        return _packages_interactive(packages, cfg, args, can_run)
+    return _packages_auto(packages, cfg, args, can_run)
+
+
+def _run_images(args: argparse.Namespace) -> int:
+    """Run the pipeline over a single image or every .jpg in a directory."""
+    target = args.target or "./base"
     if os.path.isdir(target):
         images = [
             os.path.join(target, f)
@@ -470,4 +681,100 @@ if __name__ == "__main__":
     if not images:
         raise SystemExit(f"No images to process at: {target}")
     for img in images:
-        main(img)
+        main(img, materials_all=not args.per_object, manual_seg=not args.seem)
+    return 0
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Build and parse the command line."""
+    parser = argparse.ArgumentParser(
+        prog="client.py",
+        description=(
+            "Run Modules 1-3 on a folder of paired top-down/facade packages "
+            "(the default), or on plain facade images with --images."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "target", nargs="?", default=None,
+        help="Package folder to iterate (default: data/Precise-Data). An "
+             "existing image FILE switches to image mode automatically; with "
+             "--images this is the image or directory of .jpg files instead.",
+    )
+    parser.add_argument(
+        "--images", action="store_true",
+        help="Image mode: treat the target as a facade image or a directory "
+             "of .jpg files (default: ./base) rather than a package folder.",
+    )
+
+    group = parser.add_argument_group("package mode (default)")
+    group.add_argument(
+        "--packages", nargs="?", const=str(DEFAULT_ROOT), default=None,
+        metavar="DIR",
+        help="Explicitly select package mode, optionally naming the folder of "
+             "<id>/Fac<id> pairs. Redundant now that it is the default, but "
+             "takes precedence over the positional target.",
+    )
+    group.add_argument(
+        "--ids", type=int, nargs="+", default=None,
+        help="Only these package ids, in this order.",
+    )
+    group.add_argument(
+        "--auto", action="store_true",
+        help="Batch every package unattended instead of waiting on keys.",
+    )
+    group.add_argument(
+        "--show", "--no-run", dest="show_only", action="store_true",
+        help="Display only: iterate and show the pairs, never invoke the "
+             "pipeline (and skip its availability check). With --auto this is "
+             "an unattended slideshow.",
+    )
+    group.add_argument(
+        "--list", action="store_true",
+        help="Print the discovered packages and exit.",
+    )
+    group.add_argument(
+        "--no-window", action="store_true",
+        help="Do not open a window (batch passes on a headless machine).",
+    )
+    group.add_argument(
+        "--out-root", default=str(DEFAULT_OUT_ROOT),
+        help="Parent directory for per-package pipeline outputs.",
+    )
+    group.add_argument(
+        "--cell", type=int, default=620,
+        help="Pixel size of each image panel in the window.",
+    )
+    group.add_argument(
+        "--delay", type=int, default=400,
+        help="Milliseconds to hold each package on screen in --auto mode.",
+    )
+
+    common = parser.add_argument_group("backends (both modes)")
+    common.add_argument(
+        "--seem", action="store_true",
+        help="Module 1 backend: zero-shot SEEM instead of the CMP SegFormer.",
+    )
+    common.add_argument(
+        "--per-object", action="store_true",
+        help="Module 3 classifies each detected object, not the whole wall.",
+    )
+    return parser.parse_args(argv)
+
+
+def cli(argv: list[str] | None = None) -> int:
+    """Entry point. Package mode is the default; `--images` selects image mode.
+
+    A positional target that is an existing *file* also selects image mode: a
+    file can never be a folder of pairs, so `client.py photo.jpg` keeps working
+    without the flag. A directory is read as a package folder, since that is
+    now the default — pass `--images DIR` for the old "every .jpg in DIR" pass.
+    """
+    args = _parse_args(argv)
+    if args.images or (args.target is not None and Path(args.target).is_file()):
+        return _run_images(args)
+    return _run_packages(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

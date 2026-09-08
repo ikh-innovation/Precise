@@ -33,6 +33,7 @@ selectable backend, so you can trade zero-shot flexibility for trained accuracy.
 - [Backends](#backends)
 - [Training](#training)
 - [Environments](#environments)
+- [Paired top-down / facade packages](#paired-top-down--facade-packages)
 - [Library use](#library-use)
 - [Repository layout](#repository-layout)
 
@@ -50,10 +51,22 @@ $ conda activate precise-seem-gpu
 `src/client.py` accepts an optional path:
 
 ```console
-(precise-seem-gpu) …/Precise$ python src/client.py                     # every base/*.jpg
-(precise-seem-gpu) …/Precise$ python src/client.py base/cmp_b0003.jpg   # one image
-(precise-seem-gpu) …/Precise$ python src/client.py path/to/folder       # every .jpg in a folder
+(precise-seem-gpu) …/Precise$ python src/client.py                      # browse the packages
+(precise-seem-gpu) …/Precise$ python src/client.py --auto                # batch every package
+(precise-seem-gpu) …/Precise$ python src/client.py base/cmp_b0003.jpg    # one image
+(precise-seem-gpu) …/Precise$ python src/client.py --images              # every base/*.jpg
+(precise-seem-gpu) …/Precise$ python src/client.py --images path/to/dir  # every .jpg in a folder
 ```
+
+**Package mode is the default**: bare `client.py` iterates the paired
+top-down/facade dataset in `data/Precise-Data` — see
+[Paired top-down / facade packages](#paired-top-down--facade-packages). Plain
+facade images need `--images`, except that a positional *file* selects image
+mode on its own (a file can never be a folder of pairs), so
+`client.py photo.jpg` still works unchanged.
+
+> A positional **directory** is now read as a package folder. The old
+> "every `.jpg` in this directory" pass is `--images path/to/dir`.
 
 > **Use the `precise-seem-gpu` env.** The default `python` is a CPU-only torch
 > build and cannot drive the RTX 5070. `precise-seem-gpu` has torch 2.10 (cu128)
@@ -298,6 +311,85 @@ SEEM is not available in `precise-seem-gpu`; run the SegFormer backend there
 
 ---
 
+## Paired top-down / facade packages
+
+`data/Precise-Data` holds one building per numeric id as **two** images:
+`<id>.png` (top-down / aerial) and `Fac<id>.png` (street-level facade). That
+pair is a **package**. `src/building_packages/` iterates them, shows both views
+in one window, and feeds the facade half to Modules 1–3. This is what
+`src/client.py` does by default:
+
+```console
+(precise) …/Precise$ python src/client.py                  # browse interactively
+(precise) …/Precise$ python src/client.py --auto            # batch all packages
+(precise) …/Precise$ python src/client.py --show            # display only, no models
+(precise) …/Precise$ python src/client.py --show --auto     # slideshow of every pair
+(precise) …/Precise$ python src/client.py --ids 3 7 12      # only these ids
+(precise) …/Precise$ python src/client.py --list            # index and exit
+(precise) …/Precise$ python src/client.py path/to/pairs     # a different package folder
+```
+
+`--packages [DIR]` still selects this mode explicitly and takes precedence over
+the positional target; it is redundant now that it is the default. See
+[Quickstart](#quickstart) for `--images`, which processes plain facade images.
+
+**The window shows only the two images** — no titles, captions, filenames,
+counters or key legend. Which package is on screen, its pipeline result, and the
+key reference are printed on the terminal instead.
+
+`--show` (alias `--no-run`) is the display-only path: it iterates and shows the
+pairs without importing torch, loading a checkpoint, or running the pipeline.
+Modules 1–3 are imported lazily inside the methods that use them, so `--show`
+starts instantly and works in an environment that cannot run inference at all.
+Combine it with `--auto` for an unattended slideshow — handy for eyeballing a
+folder of pairs before committing to inference.
+
+**One pair in memory at a time.** Discovery matches filenames only and never
+decodes pixels, so indexing is cheap. The iteration then decodes a package on
+entry and releases it before the next id is decoded — peak memory is a single
+pair regardless of folder size:
+
+```python
+from building_packages import discover_packages, iter_loaded, compose_package_view
+
+index = discover_packages()                 # 20 packages, all unloaded
+for package in iter_loaded(index.packages):  # exactly one resident
+    canvas = compose_package_view(package)   # top-down beside facade, BGR
+    # package.topdown / package.facade are [H, W, 3] uint8; released on the next step
+```
+
+**Interactive keys** (printed on the terminal at startup, not drawn on the canvas):
+
+| key | action |
+| --- | --- |
+| `→` / `d` | next package |
+| `←` / `a` | previous package (wraps at both ends) |
+| `r` | run Modules 1–3 on this package's facade |
+| `q` / `esc` | quit |
+
+Keys are read with `cv2.waitKeyEx`, not `cv2.waitKey`: the latter is defined as
+`waitKeyEx(delay) & 0xff`, which masks every arrow key to `0` and makes arrow
+navigation impossible. An unrecognized press reports its raw code on the
+terminal instead of being silently ignored, so a backend with different arrow
+codes is diagnosable on the spot.
+
+**Only the facade is analysed.** Module 1 (CMP SegFormer / SEEM) and Module 2
+(floors from window/door rows) are street-level models, so the top-down image is
+carried for display and context rather than pushed through them. Outputs go to
+one directory per package — `data/package_runs/package-07/` — because all pairs
+share a single input folder and would otherwise overwrite each other's
+`m1/m2/m3.json`. `Pipeline.run()` takes the matching `out_dir` argument:
+
+```python
+Pipeline(cfg, use_segformer=True).run(image="…/Fac7.png", out_dir="data/package_runs/package-07")
+```
+
+Inference failures are captured per package (`PackageRun.error`) instead of
+raised, so one bad image cannot end a batch pass. Missing checkpoints or Python
+packages are reported once at startup, and browsing still works without them.
+
+---
+
 ## Library use
 
 ```python
@@ -320,8 +412,9 @@ mats  = FacadeMaterials("base/cmp_b0001.jpg", cfg.building_materials).classify()
 Precise/
 ├── config.yaml                       # single source of truth for all knobs
 ├── src/
-│   ├── client.py                     # CLI entry point — Pipeline + main()
+│   ├── client.py                     # CLI entry point — Pipeline, images + --packages
 │   ├── config.py                     # pydantic config loader
+│   ├── building_packages/            # top-down/facade pairs: iterate, display, run
 │   ├── facade_parsing/               # Module 1 backend A: SEEM (zero-shot)
 │   ├── facade_parsing_segm/
 │   │   └── segformer_cmp/            # Module 1 backend B: SegFormer on CMP (12 classes)
@@ -330,6 +423,8 @@ Precise/
 │   ├── building_materials_minc/      # Module 3 backend B: MINC classifier
 │   └── building_materials_facade/    # Module 3 backend C: DINOv3 Facade-8 (default)
 ├── base/                             # CMP Facade Database (Module 1 data)        [gitignored]
+├── data/Precise-Data/                # paired <id>.png / Fac<id>.png packages      [gitignored]
+├── data/package_runs/                # per-package pipeline outputs                [gitignored]
 ├── data/material_datasets/           # pooled material datasets + manifest        [gitignored]
 └── src/**/runs/                      # trained checkpoints / training outputs      [gitignored]
 ```
