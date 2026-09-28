@@ -122,6 +122,174 @@ class Pipeline:
         self.cfg = cfg
         self.use_segformer = use_segformer
         self.console = Console()
+        # Loaded on first use and kept: the scene gate runs once per image but
+        # its weights are ~250 MB, so re-loading them per package would
+        # dominate a batch pass.
+        self._scene_parser = None
+
+    @property
+    def scene_parser(self):
+        """Cityscapes scene parser, loaded lazily; `None` when disabled."""
+        if not self.cfg.scene_parsing.enabled:
+            return None
+        if self._scene_parser is None:
+            from scene_parsing import SceneParser
+
+            with self.console.status(
+                "[bold cyan]Loading Cityscapes scene gate...", spinner="dots"
+            ):
+                self._scene_parser = SceneParser(self.cfg.scene_parsing)
+        return self._scene_parser
+
+    def _building_mask(self, parse_result, height: int, width: int) -> np.ndarray:
+        """Rasterize Module 1's building/facade classes to an `[H, W]` mask."""
+        from facade_parsing import BUILDING_LABELS
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+        for cls in parse_result.classes:
+            if cls.label not in BUILDING_LABELS:
+                continue
+            for poly in cls.polygons:
+                pts = np.asarray(poly.pixel, dtype=np.int32)
+                if pts.shape[0] >= 3:
+                    cv2.fillPoly(mask, [pts], 1)
+        return mask
+
+    def _scene_gate(self, image_path: Path, parse_result, height: int, width: int):
+        """Run the Cityscapes gate over Module 1's facade mask.
+
+        Returns:
+            A `BuildingRegion`, or `None` when the gate is disabled, Module 1
+            found no building, or the scene model could not be loaded — in all
+            of which cases the pipeline carries on with Module 1's own mask.
+        """
+        parser = self.scene_parser
+        if parser is None:
+            return None
+        facade = self._building_mask(parse_result, height, width)
+        if not facade.any():
+            return None
+        from scene_parsing import refine_building_region
+
+        try:
+            with self.console.status(
+                "[bold cyan]Scene gate: separating building from street...",
+                spinner="dots",
+            ):
+                scene = parser.parse(image_path)
+            return refine_building_region(facade, scene, self.cfg.scene_parsing)
+        except Exception as exc:  # noqa: BLE001 - the gate is an optional refinement
+            self.console.print(f"[yellow]Scene gate skipped: {exc}[/yellow]")
+            return None
+
+    def _opening_bounds(self, region) -> tuple[float, float, float, float] | None:
+        """The box an opening must sit in to belong to this building.
+
+        Deliberately the refined *extent*, not the refined mask: a street tree
+        crossing the facade punches a hole straight through the mask, and a
+        window seen between the leaves is still a window on this building.
+        Testing against the pixels cost packages 19 and 20 most of their real
+        windows. The extent keeps those and still excludes what actually
+        matters — a "door" detected in a hedge below the building, which
+        Module 2 would otherwise take as a 2.05 m scale anchor.
+
+        The lower edge is the bracket's ground limit rather than the last
+        visible wall, so an opening behind a parked car is not discarded.
+        """
+        if region.bbox is None:
+            return None
+        x1, y1, x2, y2 = region.bbox
+        bracket = region.base_bracket()
+        if bracket is not None:
+            y2 = max(y2, bracket[1])
+        margin = self.cfg.scene_parsing.opening_margin_ratio * max(
+            region.mask.shape[0], region.mask.shape[1]
+        )
+        return x1 - margin, y1 - margin, x2 + margin, y2 + margin
+
+    @staticmethod
+    def _drop_blobs_outside(
+        mask: np.ndarray, bounds: tuple[float, float, float, float]
+    ) -> np.ndarray:
+        """Remove whole connected blobs of `mask` whose centre is outside `bounds`."""
+        bx1, by1, bx2, by2 = bounds
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8), connectivity=8
+        )
+        if count <= 1:
+            return mask
+        keep = []
+        for i in range(1, count):
+            x, y, w, h = (
+                stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
+                stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT],
+            )
+            cx, cy = x + w / 2.0, y + h / 2.0
+            if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                keep.append(i)
+        return np.isin(labels, keep).astype(np.uint8)
+
+    def _gate_openings(
+        self, per_class: dict[str, list[Detection]], region
+    ) -> dict[str, list[Detection]]:
+        """Drop window/door detections that fall outside the building's extent."""
+        from facade_parsing import OPENING_LABELS
+
+        bounds = self._opening_bounds(region)
+        if bounds is None:
+            return per_class
+        bx1, by1, bx2, by2 = bounds
+        gated = dict(per_class)
+        for label in OPENING_LABELS:
+            detections = per_class.get(label, [])
+            kept: list[Detection] = []
+            for box, score in detections:
+                cx = (float(box[0]) + float(box[2])) / 2.0
+                cy = (float(box[1]) + float(box[3])) / 2.0
+                if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                    kept.append((box, score))
+            # Windows are never gated down to nothing — an empty list would
+            # cost Module 2 its floor count over what may be a mask
+            # disagreement rather than a set of false positives. Doors are:
+            # they only offer an optional scale anchor, most of these
+            # buildings have no detectable door anyway, and a "door" found in
+            # a hedge is worse than no door at all.
+            if kept or label == "door":
+                gated[label] = kept
+        return gated
+
+    def _regate_overlay(self, parser, region) -> np.ndarray | None:
+        """Re-render Module 1's overlay with the building classes gated.
+
+        Returns `None` when the backend cannot re-render (nothing is lost —
+        the original overlay stands), so this stays optional rather than a
+        requirement on every Module 1 implementation.
+        """
+        from facade_parsing import BUILDING_LABELS, OPENING_LABELS
+
+        render = getattr(parser, "render_overlay", None)
+        masks = getattr(parser, "last_class_masks", None)
+        if render is None or not masks:
+            return None
+        gated = dict(masks)
+        for label in BUILDING_LABELS:
+            if label in gated and gated[label].shape == region.mask.shape:
+                gated[label] = (gated[label] & region.mask).astype(np.uint8)
+        # Openings are dropped whole, by the same centre-in-extent test
+        # `_gate_openings` applies to the detections — not clipped to the
+        # extent. Clipping would leave a sliver of a rejected door drawn on an
+        # image whose label says there are none.
+        bounds = self._opening_bounds(region)
+        if bounds is not None:
+            for label in OPENING_LABELS:
+                if label in gated and gated[label].shape == region.mask.shape:
+                    trimmed = self._drop_blobs_outside(gated[label], bounds)
+                    if trimmed.any() or label == "door":
+                        gated[label] = trimmed
+        try:
+            return render(gated)
+        except Exception:  # noqa: BLE001 - cosmetic only
+            return None
 
     def _bboxes_from_class(self, class_mask: ClassMask) -> list[Detection]:
         """Convert one SEEM class's polygons into per-instance xyxy bboxes."""
@@ -146,13 +314,26 @@ class Pipeline:
                 return float(x1), float(y1), float(x2), float(y2)
         return None
 
-    def _wall_region_mask(self, parse_result, height: int, width: int) -> np.ndarray:
+    def _wall_region_mask(
+        self, parse_result, height: int, width: int, region=None, masks=None
+    ) -> np.ndarray:
         """Rasterize the wall region for Module 3: facade/house minus window/door.
 
         Returns an `[H, W]` uint8 mask (1 = wall surface) so Module 3 classifies
         the building material on real wall pixels only. Empty when Module 1
         produced no facade/house — Module 3 then fails closed (reports "none")
         rather than classifying the whole image.
+
+        When the scene gate produced a `region`, the wall is additionally
+        intersected with it, so material patches are not sampled off the street
+        tree standing in front of the wall.
+
+        `masks` are Module 1's own rasters when it keeps them. They are
+        preferred over the polygons because a backend may widen a door for
+        display — the polygons carry the geometry Module 2 measures, which is
+        deliberately *not* widened, while the raster carries the opening's
+        true outline. Subtracting the truer outline is what keeps a glazed
+        entrance out of the wall the material is read from.
         """
         from facade_parsing import BUILDING_LABELS, OPENING_LABELS
 
@@ -165,6 +346,10 @@ class Pipeline:
                 target = openings
             else:
                 continue
+            raster = (masks or {}).get(cls.label)
+            if raster is not None and raster.shape == (height, width):
+                target |= (raster > 0).astype(np.uint8)
+                continue
             for poly in cls.polygons:
                 pts = np.asarray(poly.pixel, dtype=np.int32)
                 if pts.shape[0] >= 3:
@@ -175,7 +360,15 @@ class Pipeline:
         if ratio > 0 and openings.any():
             k = max(3, int(ratio * min(height, width)))
             openings = cv2.dilate(openings, np.ones((k, k), np.uint8))
-        return ((building > 0) & (openings == 0)).astype(np.uint8)
+        wall = ((building > 0) & (openings == 0)).astype(np.uint8)
+        if region is not None and region.refined and region.mask.shape == wall.shape:
+            gated = (wall & region.mask).astype(np.uint8)
+            # Only take the gate's word for it while it leaves Module 3
+            # something to classify; an empty wall would fail the module closed
+            # over what is really a segmentation disagreement.
+            if gated.any():
+                return gated
+        return wall
 
     def _write_json(self, path: Path, model) -> None:
         """Dump a pydantic model to `path` as pretty JSON, overwriting."""
@@ -372,18 +565,55 @@ class Pipeline:
             raise RuntimeError("Module 1 did not produce an overlay image.")
 
         per_class = {c.label: self._bboxes_from_class(c) for c in parse_result.classes}
+        # Scene gate: Module 1's CMP checkpoint was trained on head-on facade
+        # crops where the whole frame is facade, so on a street capture its
+        # mask reaches through hedges, cars and pavement. Module 2's height is
+        # measured from that mask's extent, so the gate runs before it.
+        region = self._scene_gate(
+            image_path, parse_result,
+            parse_result.image.height, parse_result.image.width,
+        )
+        if region is not None and region.refined:
+            per_class = self._gate_openings(per_class, region)
         windows = per_class.get("window", [])
         doors = per_class.get("door", [])
         house_bbox = self._house_bbox(parse_result)
+        base_bracket = None
+        if region is not None and region.refined and region.bbox is not None:
+            house_bbox = region.bbox
+            base_bracket = region.base_bracket()
+            # Re-draw the overlay from the gated masks. Without this the PNG
+            # keeps showing Module 1's unrefined blob while Modules 2 and 3
+            # work off the narrowed region — the picture would contradict the
+            # numbers printed on it.
+            regated = self._regate_overlay(parser, region)
+            if regated is not None:
+                overlay = regated
+
+        # Storey-line classes (SegFormer only; SEEM's 3 prompts never emit
+        # them). Module 2 falls back to these for its vertical model when a
+        # facade shows too few window rows to fit one.
+        floor_lines = [
+            det
+            for label in self.cfg.building_features.floor_line_labels
+            for det in per_class.get(label, [])
+        ]
 
         with self.console.status(
             "[bold cyan]Module 2: floor count & building height...", spinner="dots"
         ):
-            features = BuildingFeatures(
+            features_extractor = BuildingFeatures(
                 image_path=image_path,
                 cfg=self.cfg.building_features,
                 view_type=self.cfg.pipeline.view_type,
-            ).extract(windows=windows, doors=doors, house_bbox=house_bbox)
+            )
+            features = features_extractor.extract(
+                windows=windows,
+                doors=doors,
+                house_bbox=house_bbox,
+                floor_lines=floor_lines,
+                base_bracket=base_bracket,
+            )
 
         # Module 3 backend: SigLIP2 zero-shot (default), the custom MINC timm
         # classifier, or the DINOv3 Facade-8 classifier. All expose the same
@@ -420,7 +650,8 @@ class Pipeline:
             # window/door openings (no GrabCut). Empty mask -> Module 3 fails
             # closed ("none"); it never classifies the whole image.
             wall_mask = self._wall_region_mask(
-                parse_result, parse_result.image.height, parse_result.image.width
+                parse_result, parse_result.image.height, parse_result.image.width,
+                region=region, masks=getattr(parser, "last_class_masks", None),
             )
             with self.console.status(
                 "[bold cyan]Module 3: material classification (building wall)...",
@@ -450,26 +681,72 @@ class Pipeline:
         height_m = features.predictions.building_height_m.value
         height_src = features.height_source
 
-        lines = [
+        # The on-image label carries the three results and nothing else: it is
+        # what gets read at a glance and shared. How the height was derived is
+        # diagnostic — it stays on the terminal, and in full in m2.json's
+        # `scale` block (anchors used, storey pitch, occlusion), which is the
+        # place to go when a number needs explaining.
+        image_lines = [
             f"Floors:   {floors}",
-            f"Height:   {height_m:.1f} m  ({height_src})",
+            f"Height:   {height_m:.1f} m",
         ]
         if materials_all:
             if m3_result.classified_region == "none":
-                lines.append("Material: n/a (no building region)")
+                image_lines.append("Material: n/a (no building region)")
             else:
                 dom = m3_result.dominant_material
                 # Flag the degraded read so a masked-bbox result isn't mistaken
                 # for a confident multi-patch wall classification.
                 approx = " ~approx" if m3_result.classified_region == "masked_bbox" else ""
-                lines.append(f"Material: {dom.label} ({dom.score * 100:.1f}%){approx}")
+                image_lines.append(
+                    f"Material: {dom.label} ({dom.score * 100:.1f}%){approx}"
+                )
+
+        # Terminal-only: which anchors carried the height, and how much of
+        # Module 1's mask was street rather than building.
+        detail = height_src
+        if features.scale is not None:
+            used = [a.source for a in features.scale.anchors if a.used]
+            if used:
+                detail = f"{height_src}: {'+'.join(used)}"
+            if features.scale.perspective_corrected:
+                detail += ", persp"
+        detail_lines = [f"[dim]Height source:[/dim] {detail}"]
+        # A door that had to be grown or snapped is still a usable anchor, but
+        # it is worth seeing next to the height it carries.
+        recovery = getattr(parser, "last_door_refinement", None)
+        snapped = getattr(features_extractor, "last_door_snap_px", 0.0)
+        rect_px = getattr(parser, "last_rectified_door_px", 0)
+        if (recovery is not None and recovery.changed) or snapped > 0 or rect_px:
+            parts = []
+            if recovery is not None and recovery.changed:
+                if recovery.promoted_px:
+                    parts.append(f"+{recovery.promoted_px}px won from shop")
+                if recovery.extended_px:
+                    parts.append(
+                        f"+{recovery.extended_px}px to opening base "
+                        f"({recovery.extended}/{recovery.components} doors)"
+                    )
+            if rect_px:
+                rect = getattr(parser, "last_rectification", None)
+                f = f", f~{rect.focal_px:.0f}px" if rect and rect.focal_px else ""
+                parts.append(f"+{rect_px}px from the rectified pass{f}")
+            if snapped > 0:
+                parts.append(f"foot snapped {snapped:.0f}px")
+            detail_lines.append(f"[dim]Door recovery:[/dim] " + "; ".join(parts))
+        if region is not None and region.refined:
+            detail_lines.append(
+                f"[dim]Mask:[/dim] {region.kept_ratio:.0%} kept, "
+                f"base {region.base_occluded_ratio:.0%} occluded"
+            )
 
         out_path = json_dir / f"{image_path.stem}_pipeline.png"
-        final = self._save_annotated(overlay, lines, per_object_labels, out_path)
+        final = self._save_annotated(overlay, image_lines, per_object_labels, out_path)
 
         summary = [
             f"[dim]Windows:[/dim] {len(windows)}   [dim]Doors:[/dim] {len(doors)}",
-            *lines,
+            *image_lines,
+            *detail_lines,
             f"[dim]Output PNG:[/dim] {final}",
             f"[dim]JSON outputs:[/dim] m1.json, m2.json, m3.json (in {json_dir})",
         ]

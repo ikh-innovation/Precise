@@ -146,6 +146,21 @@ class FacadeParser:
         self.config_path, self.weight_path = _resolve_backbone(cfg.backbone)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.last_visualization_image: np.ndarray | None = None
+        self.last_class_masks: dict[str, np.ndarray] | None = None
+        self.last_image_bgr: np.ndarray | None = None
+
+    def render_overlay(self, masks: dict[str, np.ndarray] | None = None) -> np.ndarray | None:
+        """Re-draw the class overlay, optionally from edited masks.
+
+        Module 1b narrows the building mask after `parse()` has already drawn
+        its overlay; re-rendering here keeps the annotated PNG showing the
+        region the rest of the pipeline actually used.
+        """
+        if self.last_image_bgr is None or self.last_class_masks is None:
+            return None
+        return self._draw_overlay(
+            self.last_image_bgr, self.last_class_masks if masks is None else masks
+        )
         self.last_mask_dir: Path | None = None
         self.last_class_pixel_counts: dict[str, int] = {p: 0 for p in cfg.prompts}
 
@@ -416,6 +431,11 @@ class FacadeParser:
                 )
             )
 
+        # Kept so the overlay can be re-rendered after Module 1b's scene gate
+        # narrows the building mask — otherwise the PNG would keep showing the
+        # unrefined region while Modules 2 and 3 used the refined one.
+        self.last_class_masks = masks
+        self.last_image_bgr = image_bgr
         self.last_visualization_image = self._draw_overlay(image_bgr, masks)
 
         return FacadeParsingResult(

@@ -23,13 +23,108 @@ facade_parsing:
     door: [0, 255, 0]
   model_version: v1.0
 
+# Scene gate for Module 1's facade mask. The CMP checkpoint is trained on
+# tightly-cropped head-on facades where the whole frame is facade, so on
+# street-level captures it labels hedges, cars, pavement and sky as `facade`.
+# A Cityscapes-finetuned SegFormer *is* in domain for street photography, and
+# is used here only to keep the parts of Module 1's mask it also calls
+# `building`. Weights download from the Hub on first run, then cache.
+scene_parsing:
+  enabled: true
+  # b0..b5 trade speed for accuracy; b4 is ~64M params and runs in ~1-2 s.
+  model_id: nvidia/segformer-b4-finetuned-cityscapes-1024-1024
+  device: auto
+  input_long_side: 1024
+  # Refuse the gate rather than empty the pipeline when it disagrees with
+  # Module 1 about almost the whole mask (more likely a bad scene parse).
+  min_kept_ratio: 0.25
+  morph_kernel_px: 5
+  # Not "keep only the largest": a street tree crossing a facade splits it into
+  # two legitimate halves.
+  min_component_ratio: 0.15
+  min_column_pixels_ratio: 0.05
+  # Extent percentile per edge — the bottom favours columns that reached the
+  # base, without letting one stray row set the extent.
+  edge_percentile: 5.0
+  base_probe_ratio: 0.04
+  # Slack around the refined extent when deciding whether a window or door
+  # belongs to this building. Tested against the extent, not the mask: a tree
+  # crossing the facade holes the mask, and a window seen between the leaves
+  # is still a window on this building.
+  opening_margin_ratio: 0.02
+  model_version: v1.0
+
 building_features:
   assumed_door_height_m: 2.05
+  # Last-resort only: height = floor_count * this, used when no scale anchor
+  # (door / storey pitch / window) can be formed at all.
   assumed_floor_height_m: 3.2
   window_cluster_tol_ratio: 0.6
   plausible_floor_height_m: [2.4, 4.5]
   bottom_door_tol_ratio: 0.15
-  model_version: v1.0
+  # Largest height/width a door candidate may have and still anchor the scale.
+  # A 0.9 m x 2.05 m leaf is 2.3 and obliquity does not take a real door much
+  # past 3; beyond that it is a shadow down a reveal or a drainpipe, and the
+  # anchor is chosen by "tallest wins", which is the one contest a sliver is
+  # good at. Only the upper bound applies: a *wide* candidate is a double door,
+  # a garage, or an entrance whose foot has not been put back on the ground.
+  door_max_aspect: 4.0
+  # A door reaches the ground, so one whose mask stops short of the resolved
+  # base row is truncated — by a parked car, or by the shopfront glazing that
+  # took its lower half — and a short span makes the building tall. Its foot is
+  # then moved down to the base row, but only where the storey pitch says the
+  # door is too short to be a whole one: 2.05 m in a 3 m storey is 0.68 of a
+  # pitch, so anything already past `door_short_storeys` is a door, a shopfront
+  # or a garage band and is left exactly as detected, and a correction that
+  # would push a door past `door_max_storeys` is refused. The pitch only
+  # decides whether to trust the foot; what replaces it is the base row, so the
+  # door anchor stays independent of the pitch anchor it is fused with.
+  door_short_storeys: 0.55
+  door_max_storeys: 0.85
+  # Fallback bound for facades too irregular to fit a storey pitch: move the
+  # foot by at most this fraction of the door's own detected height. 0
+  # disables the correction there.
+  door_base_snap_ratio: 0.5
+
+  # --- metric scale recovery (src/building_features/scale.py) ---------------
+  # Reference lengths for the door-free anchors. `assumed_floor_pitch_m` is
+  # floor-to-floor, not floor-to-ceiling: 2.9-3.1 m is typical for Spanish
+  # post-war apartment blocks, which is what this AOI is.
+  assumed_floor_pitch_m: 3.0
+  assumed_window_height_m: 1.45
+  # Relative 1-sigma per anchor. These set the inverse-variance weights when
+  # anchors are fused, so their ratios matter more than absolute values.
+  sigma_rel_door: 0.08
+  sigma_rel_floor_pitch: 0.10
+  sigma_rel_window: 0.25
+  # Anchors further than this from the median (log space) are discarded before
+  # fusing; 0.35 ~ +/-42%.
+  scale_agreement_log_tol: 0.35
+  # Window rows needed before solving for the vertical vanishing point, and the
+  # fraction of the affine residual the perspective fit must beat to be used.
+  min_rows_for_perspective: 4
+  perspective_improvement: 0.85
+  # Largest scale ratio across the detected window rows a candidate vanishing
+  # point may imply; stops the fit inventing extreme foreshortening to chase
+  # noisy rows. A camera across a road from a 30 m block gives about 3; a
+  # narrow street with a steep look-up can reach 8.
+  max_vertical_scale_ratio: 8.0
+  # Storeys of facade the model may place beyond the outermost window rows —
+  # the extrapolation is where a bad vanishing point does its damage. Above the
+  # top row: half a storey plus a parapet or setback penthouse. Below the
+  # bottom row: half a storey plus the taller shopfront storey.
+  max_storeys_above_top_row: 2.5
+  max_storeys_below_bottom_row: 3.0
+  # A row holding fewer than this fraction of the median row's boxes is a
+  # segmentation artefact, not a storey, and is dropped before the pitch is
+  # measured (a spurious row halves the apparent pitch).
+  min_row_members_ratio: 0.34
+  # Module 1 classes that mark storey lines; a backup source of rows when the
+  # windows alone are too few to fit the vertical model.
+  floor_line_labels: [sill, balcony, cornice, molding]
+  # v2.0: height is measured through a fitted vertical model + fused scale
+  # anchors instead of door-or-constant. Output gains the `scale` block.
+  model_version: v2.0
 
 building_materials:
   # SigLIP2 ViT-L (384px) — strong fine-grained material/texture, ~1.6 GB,
@@ -205,4 +300,101 @@ facade_parsing_segformer:
   overlay_alpha: 0.4
   min_polygon_area_px: 80.0
   poly_simplify_eps_ratio: 0.01
+
+  # --- door recovery (src/facade_parsing_segm/segformer_cmp/door_refine.py) --
+  # `pred = argmax` gives a door only where `door` outscores all 11 other CMP
+  # classes, and it is set up to lose. `door` is the RAREST class in CMP (1.26%
+  # of training pixels vs 2.98% for `shop`), so the model carries a prior that
+  # argues against it; and `shop` — the shopfront glazing — is exactly what a
+  # glass entrance looks like. Across data/package_runs the shop region is
+  # 4-30x the door region and covers the same rows, leaving Module 2 the dark
+  # lintel above the leaves as its 2.05 m scale anchor.
+  #
+  # Two steps recover the rest, from the probabilities the same forward pass
+  # already produced — no retraining. Both are downward-biased on purpose: a
+  # door reaches the ground and the glazing it sits in reaches the ground with
+  # it, so downward is the only direction in which growing a mask is an
+  # argument rather than a guess.
+  #
+  # Measured over all 20 packages: door-anchor median error against 2.05 m
+  # falls from 0.266 to 0.245 in log terms (0.209 -> 0.170 over the anchors
+  # actually fused), package 9 goes 1.26 -> 2.01 m, package 19 2.29 -> 2.07 m,
+  # package 16's 9 px-wide sliver is dropped rather than believed, and nothing
+  # regresses or falls back. NOTE this needs `building_features.door_max_aspect`
+  # — growing doors changes which one is tallest, and without the shape gate a
+  # 12 px strip beside an ATM takes the anchor from a real entrance.
+  door_refine: true
+  door_prior_tau: 1.0
+  door_outbids: [shop]
+  door_min_prob: 0.10
+  # A prior correction is pointwise and has no sense of direction: it wins
+  # pixels above the door as readily as below it, which is the one thing the
+  # door's span cannot afford (unrestricted it took the shopfront band above
+  # the entrance in package 2 and turned a 2.11 m door into 3.65 m). Wins are
+  # therefore limited to pixels below an existing door pixel in the same
+  # column — a door carried down toward the ground it must stand on.
+  door_promote_downward_only: true
+  # Step 2, the walk to the opening base.
+  door_extend_into: [shop]
+  door_extend_row_ratio: 0.5
+  # Ceiling on the recovered door, as a fraction of the facade's pixel height.
+  # A 2.05 m door is ~0.29 of a two-storey facade and ~0.06 of a twelve-storey
+  # one, so this only binds on low buildings.
+  door_max_facade_ratio: 0.35
+  # Step 3, widening — the MASK only, never the measurement. Where the columns
+  # beside a door are still shopfront, the entrance is wider than the label:
+  # package 20's left entrance is 30 px of mask on a ~107 px gated opening,
+  # because the model reads the see-through iron gate beside the leaf as
+  # glazing (p(shop)=0.93 vs p(door)=0.03 — beyond any threshold or prior).
+  # Bounded by the door's own height: a double leaf is 1.8 m wide against
+  # 2.05 m tall, and that bound is all that stops this annexing a shopfront.
+  #
+  # Module 2 is deliberately not shown the result. Widening cannot change a
+  # door's height, but it does change its aspect, which is what tells a door
+  # from a drainpipe: feeding widened doors to the anchor picker put package
+  # 16's 9 px sliver back in play and moved the door-anchor median from 0.245
+  # to 0.256. It is used for the overlay and for the opening region Module 3
+  # subtracts from the wall.
+  door_widen: true
+  door_widen_max_width_ratio: 1.3
+  door_widen_col_ratio: 0.5
+
+  # --- rectified second opinion (segformer_cmp/rectify.py) ------------------
+  # CMP is rectified head-on facades; these are Street View captures taken
+  # from across a road, so the facade is tilted back AND turned away. Measured
+  # on the held-out CMP split by warping it with a known homography:
+  #
+  #     warp                    mIoU    door IoU
+  #     none (as trained)       0.584   0.523
+  #     look-up  k_v=0.20       0.499   0.436
+  #     oblique  k_h=0.10       0.540   0.362   <- door -31%
+  #
+  # Obliquity is what the door class cannot survive, and door is what Module 2
+  # takes its metric scale from. So the facade is warped fronto-parallel (from
+  # its own line segments, restricted to Module 1's facade mask) and the model
+  # is asked again.
+  #
+  # The merge is ADD-ONLY: confident rectified doors are taken, nothing is
+  # ever removed on the rectified pass's word. The checkpoint is unstable
+  # enough that this pass loses doors about as often as it finds them — gains
+  # on packages 8, 14, 20, loses on 5, 10, 18, 19 — and add-only makes every
+  # loss a no-op while keeping the gains. Package 20's gated entrance, which
+  # no threshold, prior correction or resolution change could reach, goes from
+  # p(door) 0.02 to 0.80. Costs one extra forward pass per image.
+  #
+  # The durable fix is to train with perspective augmentation (the warps above
+  # are the recipe), after which this can be turned off.
+  door_rectified_pass: true
+  rect_min_door_prob: 0.5
+  rect_min_segment_ratio: 0.02
+  rect_angle_tol_deg: 25.0
+  rect_ransac_iters: 500
+  rect_inlier_tol: 0.012
+  rect_seed: 0
+  # Guards; each rejects a warp observed to be worse than no warp at all.
+  rect_min_focal_ratio: 0.3
+  rect_max_focal_ratio: 8.0
+  rect_max_rotation_deg: 20.0
+  rect_max_anisotropy: 1.6
+
   model_version: v1.0

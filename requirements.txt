@@ -12,6 +12,10 @@ rich>=13.0
 # Optional: SegFormer reproduction of the published 12-class CMP result
 # (src/facade_parsing_segm/segformer_cmp). Uses the HuggingFace Trainer recipe;
 # the nvidia/mit-b0 backbone is downloaded from the Hub on first run.
+#
+# Also used by Module 1b (src/scene_parsing), which pulls a Cityscapes-finetuned
+# SegFormer from the Hub to tell the building apart from the street. No extra
+# dependency — set `scene_parsing.enabled: false` in config.yaml to skip it.
 transformers>=4.30
 accelerate>=0.20
 

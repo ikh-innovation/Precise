@@ -33,6 +33,8 @@ from facade_parsing.schemas import (
     ViewType,
 )
 
+from . import rectify as rectify_mod
+from .door_refine import DoorRefinement, refine_doors, widen_doors
 from .labels import CLASS_NAMES, COLORS_BGR
 
 Bbox = tuple[float, float, float, float]
@@ -96,6 +98,28 @@ class FacadeSegformerParser:
 
         self.last_visualization_image: np.ndarray | None = None
         self.last_class_pixel_counts: dict[str, int] = {}
+        self.last_class_masks: dict[str, np.ndarray] | None = None
+        self.last_image_bgr: np.ndarray | None = None
+        # What the door recovery changed on the last `parse()`; the caller
+        # prints it, because a door that grew by 3x is worth seeing next to
+        # the height it then anchors.
+        self.last_door_refinement = DoorRefinement()
+        # The rectified second opinion's outcome on the last `parse()`.
+        self.last_rectification: rectify_mod.Rectification | None = None
+        self.last_rectified_door_px: int = 0
+
+    def render_overlay(self, masks: dict[str, np.ndarray] | None = None) -> np.ndarray | None:
+        """Re-draw the class overlay, optionally from edited masks.
+
+        Module 1b narrows the building mask after `parse()` has already drawn
+        its overlay; re-rendering here keeps the annotated PNG showing the
+        region the rest of the pipeline actually used.
+        """
+        if self.last_image_bgr is None or self.last_class_masks is None:
+            return None
+        return self._draw_overlay(
+            self.last_image_bgr, self.last_class_masks if masks is None else masks
+        )
 
     @torch.no_grad()
     def _predict_probs(self, image_rgb: np.ndarray) -> np.ndarray:
@@ -186,6 +210,40 @@ class FacadeSegformerParser:
                         font, fs, (255, 255, 255), th, cv2.LINE_AA)
             y += row
 
+    @torch.no_grad()
+    def _rectified_door(
+        self, image_bgr: np.ndarray, probs: np.ndarray, pred: np.ndarray, door_id: int
+    ) -> np.ndarray | None:
+        """Doors the model finds once the facade is warped fronto-parallel.
+
+        Returns a bool mask in the original image's frame, or `None` when no
+        usable rectification could be estimated. The caller merges it
+        additively — see `rectify.py` for why nothing may be removed on this
+        pass's word.
+        """
+        facade_id = self.display_to_ids.get("facade", [None])[0]
+        facade = (pred == facade_id).astype(np.uint8) if facade_id is not None else None
+        rect = rectify_mod.estimate(image_bgr, facade, self.cfg)
+        self.last_rectification = rect
+        if not rect.ok:
+            return None
+
+        warped, crop = rectify_mod.warp_for_inference(image_bgr, rect.homography)
+        if warped.size == 0 or min(warped.shape[:2]) < 32:
+            return None
+        rect_probs = self._predict_probs(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+        # A door has to win its own argmax over there, not merely score well,
+        # so a diffuse second opinion cannot leak in.
+        won = (rect_probs.argmax(0) == door_id) & (
+            rect_probs[door_id] >= self.cfg.rect_min_door_prob
+        )
+        if not won.any():
+            return None
+        back = rectify_mod.unwarp_channel(
+            won.astype(np.float32), rect.homography, crop, image_bgr.shape[:2]
+        )
+        return back >= 0.5
+
     # ----- public API --------------------------------------------------------
     def parse(self) -> FacadeParsingResult:
         """Segment the image into all CMP classes; return a SEEM-compatible result."""
@@ -198,14 +256,71 @@ class FacadeSegformerParser:
         probs = self._predict_probs(image_rgb)
         pred = probs.argmax(0).astype(np.uint8)
 
+        # Recover the entrance the argmax split between `door` and `shop`
+        # before anything is measured off it. This rewrites `pred` rather than
+        # sitting beside it, so the masks stay disjoint and every consumer —
+        # polygons, overlay, Module 3's wall — sees the same labelling.
+        if getattr(self.cfg, "door_refine", False):
+            pred, self.last_door_refinement = refine_doors(
+                probs, pred,
+                {n.lower(): int(i) for i, n in self.model.config.id2label.items()},
+                self.cfg,
+            )
+        else:
+            self.last_door_refinement = DoorRefinement()
+
+        # Second opinion: the same model on a fronto-parallel warp of the same
+        # facade. Add-only — it may find a door the straight-on pass called
+        # shopfront, but it never takes one away, because it loses doors about
+        # as often as it finds them and only the gains are trustworthy.
+        self.last_rectified_door_px = 0
+        if getattr(self.cfg, "door_rectified_pass", False):
+            door_id = self.display_to_ids.get("door", [None])[0]
+            if door_id is not None:
+                extra = self._rectified_door(image_bgr, probs, pred, door_id)
+                if extra is not None:
+                    # Only from the classes a door is allowed to take, the
+                    # same set the prior correction uses. Unrestricted, the
+                    # rectified pass took 42% of package 18's new door from
+                    # `facade` and 13% from `window` — the building extent
+                    # Module 2 measures height against, and the rows it
+                    # counts storeys from — and cost that package its scale.
+                    takeable = [
+                        self.display_to_ids[n][0]
+                        for n in getattr(self.cfg, "door_outbids", [])
+                        if n in self.display_to_ids and self.display_to_ids[n]
+                    ]
+                    gained = extra & (pred != door_id)
+                    if takeable:
+                        gained &= np.isin(pred, takeable)
+                    self.last_rectified_door_px = int(gained.sum())
+                    if gained.any():
+                        pred = pred.copy()
+                        pred[gained] = door_id
+
+        # `pred` is what Module 2 measures; `shown` is the same labelling with
+        # each door widened into the opening it sits in. They are separated
+        # because widening makes a mask truer to look at and to subtract from
+        # Module 3's wall, while changing a door's aspect — which is exactly
+        # what Module 2's anchor picker uses to tell a door from a drainpipe.
+        name_to_id = {n.lower(): int(i) for i, n in self.model.config.id2label.items()}
+        shown = pred
+        if getattr(self.cfg, "door_widen", False):
+            wide = widen_doors(pred, name_to_id, self.cfg)
+            door_id = name_to_id.get("door")
+            if door_id is not None and wide.any():
+                shown = pred.copy()
+                shown[wide] = door_id
+
         masks: dict[str, np.ndarray] = {}
         classes: list[ClassMask] = []
         for name in DISPLAY_CLASSES:
             ids = self.display_to_ids.get(name, [])
             if not ids:
                 continue
+            # Geometry from `pred`, pixels from `shown`.
             mask = np.isin(pred, ids).astype(np.uint8)  # union (window = window+blind)
-            masks[name] = mask
+            masks[name] = np.isin(shown, ids).astype(np.uint8)
             area = int(mask.sum())
             self.last_class_pixel_counts[name] = area
             if area == 0:
@@ -233,6 +348,11 @@ class FacadeSegformerParser:
                 pixel_area=area, bbox=bbox, polygons=polygons, mask_path=None,
             ))
 
+        # Kept so the overlay can be re-rendered after Module 1b's scene gate
+        # narrows the building mask — otherwise the PNG would keep showing the
+        # unrefined region while Modules 2 and 3 used the refined one.
+        self.last_class_masks = masks
+        self.last_image_bgr = image_bgr
         self.last_visualization_image = self._draw_overlay(image_bgr, masks)
         return FacadeParsingResult(
             image=ImageInfo(id=self.image_path.stem, width=w, height=h),

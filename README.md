@@ -97,26 +97,169 @@ polygons, confidence) and a color overlay.
 - `facade` (SegFormer) / `house` (SEEM) is taken as the **building extent**;
   `window` and `door` feed Modules 2 and 3.
 - The **SEEM** backend is a zero-shot alternative that emits `house/window/door`.
+- **Door recovery** (`segformer_cmp/door_refine.py`, SegFormer backend only).
+  `door` is the rarest class in CMP (1.26% of training pixels vs 2.98% for
+  `shop`), so a glass entrance set into a shopfront loses the argmax to
+  `shop` and only its dark lintel survives. Three steps fix that, all from
+  the same forward pass: the prior is divided out of `door`'s score against
+  `shop` (logit adjustment), each door is walked *down* through the glazing
+  to its base, and the mask is widened sideways into the opening. The first
+  two feed Module 2's scale anchor; the third is **presentation only** —
+  widening cannot change a door's height but it does change its aspect, which
+  is what Module 2 uses to tell a door from a drainpipe, so the geometry
+  Module 2 reads stays un-widened. See that module's docstring for what was
+  measured and what was rejected.
+- **Rectified second opinion** (`segformer_cmp/rectify.py`). CMP is rectified
+  head-on facades; these are Street View captures from across a road. Warping
+  the held-out CMP split by a known homography measures the cost directly:
+  a 0.10 oblique warp drops **door IoU 31%** (0.523 → 0.362) where even
+  severe look-up drops it 17% — obliquity is what the door class cannot
+  survive, and door is what Module 2 measures scale from. So the facade is
+  warped fronto-parallel — vanishing points from its own line segments
+  (restricted to the facade mask, or the road wins), focal length from their
+  orthogonality, `H = K·Rᵀ·K⁻¹` — and the model is asked again. The merge is
+  **add-only** and restricted to the same classes a door may outbid: the
+  checkpoint loses doors on a rectified frame about as often as it finds
+  them, so only gains are trusted. Package 20's gated entrance, at p(door)
+  = 0.02 in the straight-on pass and out of reach of every threshold, prior
+  and resolution change tried, comes back at 0.80. Fires on 9/20; costs one
+  extra forward pass.
+
+### Module 1b — Scene gate (Cityscapes)
+**In:** the RGB image + Module 1's facade mask. **Out:** a refined building
+mask, a tightened extent, and a bracket on where the building's base really is.
+
+Module 1's CMP checkpoint is trained on tightly-cropped, head-on facade
+photographs in which essentially the whole frame *is* facade — so it has never
+had to learn what "not a facade" looks like. On street-level captures it labels
+hedges, parked cars, pavement and sky as `facade` and returns a blob. Measured
+on the 20-building sample, **24–54% of the mask was street rather than
+building** in the worst cases.
+
+A **Cityscapes-finetuned SegFormer** *is* in domain for street photography, so
+it is used as a gate: keep the parts of Module 1's mask that the street model
+also calls `building`/`wall`. Module 1 keeps the job CMP actually taught it —
+`window`, `door`, `sill`, `balcony`.
+
+Two details carry most of the value:
+
+- **Occluders raise the lower edge; they do not reveal the base.** A hedge in
+  front of a plinth is building *behind* vegetation, so simply deleting it
+  leaves the mask ending above the true base and the building measures short.
+  The gate instead reports a **bracket** — the lowest wall actually seen, and
+  the row where the ground in front of it begins — and Module 2 places the base
+  inside it using the storey pitch. Skipping this biased heights short by
+  ~12% at the median across the sample (28.8 m vs 32.6 m).
+- **An abutting neighbour cannot be separated here.** Both wings are genuinely
+  `building` to any segmenter; telling them apart is a depth question, not a
+  semantic one. The residual is reported as `components_kept` rather than
+  hidden.
+
+The refined mask also gates Module 3, so material patches are not sampled off
+a street tree standing in front of the wall, and Module 1's overlay is
+re-rendered from it so the PNG shows the region the pipeline actually used.
+Window and door detections outside the refined *extent* are dropped — a "door"
+found in a hedge would otherwise become a 2.05 m scale anchor. That test is
+against the extent, not the mask: a tree crossing the facade holes the mask,
+and a window seen between the leaves is still a window on this building.
+
+Disable with `scene_parsing.enabled: false`; weights download from the Hub on
+first run (~250 MB, cached), and the gate adds roughly 1–2 s per image.
 
 ### Module 2 — Building features (geometry heuristics)
 **In:** window/door bboxes + the building bbox from Module 1. **Out:** floor
-count and building height, each with a confidence and a `height_source`.
+count and building height, each with a confidence, plus a `height_source` and a
+`scale` block recording how metres were recovered.
 
 - **Floors** — window Y-centers are clustered into rows (a new row starts when
   the vertical gap exceeds `window_cluster_tol_ratio × median window height`).
-  Row count = floors.
-- **Height** — two paths:
-  - `door_scale` *(preferred)*: calibrate meters-per-pixel from the ground-floor
-    door (assumed ≈ 2.05 m tall), scale up by the building's pixel height.
-    Accepted only if the implied per-floor height is plausible (2.4–4.5 m).
-  - `fallback`: `floor_count × assumed_floor_height_m` (3.2 m).
-  - `none`: neither doors nor floors were found.
+  Rows too sparse to be a storey are dropped, and a gap spanning two storeys
+  counts as two, so a floor whose windows were all missed is still counted.
+- **Height** — *measured*, in two steps
+  ([`scale.py`](src/building_features/scale.py)):
+
+  1. **Vertical model.** A street photo of a tall block looks *up*, so
+     metres-per-pixel shrinks toward the roof. On a vertical facade plane
+     `t(y) = 1/(y − y_vp)` is affine in real height, and equally spaced storeys
+     land on an arithmetic progression in `t` — so the vanishing point `y_vp`
+     is solved from the facade's own storey rhythm, with no camera metadata
+     (these are screenshots; there is no EXIF) and no calibration target. The
+     fit is bounded by how far it may extrapolate past the outermost window
+     row, which is where an unconstrained vanishing point does its damage.
+  2. **Scale anchors, fused.** Each cue yields the same quantity — metres per
+     unit of `t` — so they combine rather than compete: the **door** (≈ 2.05 m,
+     when one is visible), the **storey pitch** (≈ 3.0 m, available whenever
+     the facade shows enough window rows), and the **median window** (≈ 1.45 m,
+     a weak third opinion). They are merged by inverse-variance weighting in
+     log space after anchors that disagree with the median are discarded —
+     which is what catches a "door" mask that actually caught a shopfront
+     shutter.
+  3. **The door class is not allowed to lose on a technicality.** `door` is
+     the rarest class in CMP — 1.26% of training pixels against 2.98% for
+     `shop` — so the model carries a prior that argues against it, and `shop`
+     (the shopfront glazing) is exactly what a glass entrance looks like. In
+     17 of 20 packages the shop region is 4–30× the door region and covers the
+     same rows, so what reaches Module 2 is the dark lintel above the leaves.
+     Module 1 therefore rescores `door` with the training prior divided out
+     (logit adjustment) against `shop` only, then walks the door down through
+     the glazing to its base. Both steps only ever grow a door *downward*,
+     which is the one direction the physics supports — a door reaches the
+     ground, and so does the glazing it sits in. Letting it grow any other way
+     was measured and was worse; letting it outbid `facade` is worse still,
+     because `facade` is the building extent the height is measured from.
+     Because growing doors changes which one is tallest, the anchor is now
+     also picked with a shape gate (`door_max_aspect`): a 12 px strip beside
+     an ATM is not a door, however tall it grows.
+  4. **A truncated door is put back on the ground.** A door reaches the
+     ground, so one whose mask stops short of the resolved base row is
+     missing part of itself — hidden behind a parked car, or lost to the
+     shopfront glazing it is set into, which CMP labels `shop` rather than
+     `door`. A short span makes the building *tall*, and by the most heavily
+     weighted anchor there is. The foot is therefore moved down to the base
+     row, but only where the storey pitch says the door is too short to be a
+     whole one (2.05 m in a 3 m storey is ≈ 0.68 of a pitch), and only as far
+     as still leaves a plausible door. Anything already door-sized is left
+     exactly as detected. The pitch decides only *whether* to trust the foot;
+     what replaces it is the base row, so the anchor keeps its independence
+     from the pitch anchor it is fused with. `snapped_px` on the door anchor
+     records the correction. On the 20-building sample it fires once — the
+     Santander entrance in package 19 — and leaves the other nineteen
+     untouched.
+
+  Together, steps 3 and 4 move the door anchor's median error against 2.05 m
+  from 0.266 to 0.245 in log terms (0.209 → 0.170 over the anchors actually
+  fused): package 9 goes 1.26 m → 2.01 m, package 19 0.72 m → 2.07 m, and
+  package 16's 9 px-wide sliver is dropped rather than believed. Nothing
+  regresses and nothing falls back to `floor_count × 3.2`. Several more
+  packages get a visibly fuller door in the overlay without their anchor
+  moving at all.
+
+  Height is then the **facade mask's full extent** through that scale, so the
+  taller shopfront storey, the parapet and any setback penthouse all count.
+  `height_source` names what carried it: `door_scale`, `floor_pitch`,
+  `window_scale`, `fused`, or — only when no anchor at all could be formed, or
+  the result failed its storey-budget sanity check — `fallback`
+  (`floor_count × assumed_floor_height_m`), else `none`.
+
+  On the 20-building Valencia sample this moves 17/20 from `fallback` to a
+  measured height — **20/20 once the Module 1b scene gate cleans the mask** —
+  with recovered storey pitches of 2.4–3.4 m. Against a synthetic pinhole
+  camera with known ground truth (12–40 m blocks, look-up angles 4°–40°) the
+  worst error is **2.8 %**.
+
+  Accuracy on the real sample is *unverified*: there is no ground truth for
+  these buildings yet, so the only error figure that means anything is the
+  synthetic one.
 
 ### Module 3 — Material classification
 **In:** the image + Module 1's building region. **Out:** ranked wall materials,
 the dominant pick, and its reference mechanical properties.
 
-- The wall region is `facade` **minus dilated `window`/`door` openings**.
+- The wall region is `facade` **minus dilated `window`/`door` openings**,
+  taken from Module 1's rasters when it keeps them rather than from the
+  simplified polygons — the raster carries the opening's true outline,
+  including the widened door, which is what keeps shopfront glazing out of
+  the pixels the material is read from.
   Classification is read **strictly from that region** — non-wall pixels are
   neutralised before the model sees them and **there is no whole-image
   fallback**. If Module 1 finds no building, the result is
@@ -184,19 +327,44 @@ same values divided by width/height (0–1).
 | `view_type` | `"facade" \| "topdown"` | view mode |
 | `predictions.building_height_m` | `{value: float, confidence: 0–1}` | estimated height in metres |
 | `predictions.floor_count` | `{value: int, confidence: 0–1}` | estimated number of floors |
-| `height_source` | `"door_scale" \| "fallback" \| "none"` | which height method was used |
+| `height_source` | `"door_scale" \| "floor_pitch" \| "window_scale" \| "fused" \| "fallback" \| "none"` | which cue carried the height |
+| `scale` | `ScaleReport \| null` | how pixels became metres; `null` when the height fell back |
 | `metadata` | `{model_version, timestamp}` | run info |
+
+**`ScaleReport`** — `metres_per_pixel_at_base` (the *local* scale at the foot of
+the facade; under perspective it shrinks toward the roof), `sigma_rel`,
+`perspective_corrected`, `vertical_vanishing_point_y`, `storey_pitch_m`,
+`storey_pitch_residual`, `facade_span_px`, `rows_detected`, and `anchors[]` —
+every cue that was formed, each with its `reference_m`, its own implied scale,
+its `sigma_rel`, and whether it was `used` or discarded as an outlier.
 
 ```jsonc
 {
-  "image": { "id": "cmp_b0004", "width": 1024, "height": 691 },
+  "image": { "id": "Fac5", "width": 413, "height": 688 },
   "view_type": "facade",
   "predictions": {
-    "building_height_m": { "value": 17.5, "confidence": 0.8789 },
-    "floor_count":       { "value": 4,    "confidence": 0.8629 }
+    "building_height_m": { "value": 30.4, "confidence": 0.763 },
+    "floor_count":       { "value": 8,    "confidence": 0.7611 }
   },
-  "height_source": "door_scale",
-  "metadata": { "model_version": "v1.0", "timestamp": "2026-08-24T09:35:54.811932Z" }
+  "height_source": "fused",
+  "scale": {
+    "metres_per_pixel_at_base": 0.036033,
+    "sigma_rel": 0.0935,
+    "perspective_corrected": true,
+    "vertical_vanishing_point_y": -1357.6,
+    "storey_pitch_m": 2.98,
+    "storey_pitch_residual": 0.0079,
+    "facade_span_px": 590.0,
+    "rows_detected": 7,
+    "anchors": [
+      // Rejected: this "door" was a shopfront element, not a 2.05 m doorway.
+      // `snapped_px`: pixels the door's foot was moved down to reach the base row (0 = as detected).
+      { "source": "door",        "reference_m": 2.05, "metres_per_pixel_at_base": 0.021735, "sigma_rel": 0.08,   "used": false, "detail": { "span_px": 90.0, "snapped_px": 0.0 } },
+      { "source": "floor_pitch", "reference_m": 3.0,  "metres_per_pixel_at_base": 0.036247, "sigma_rel": 0.1008, "used": true,  "detail": { "rows": 7.0 } },
+      { "source": "window",      "reference_m": 1.45, "metres_per_pixel_at_base": 0.034741, "sigma_rel": 0.25,   "used": true,  "detail": { "count": 38.0 } }
+    ]
+  },
+  "metadata": { "model_version": "v2.0", "timestamp": "2026-09-16T08:54:18.894149Z" }
 }
 ```
 
@@ -251,7 +419,8 @@ Everything tunable lives in [`config.yaml`](config.yaml):
 | `pipeline` | `view_type` (`facade`/`topdown`), `materials_all` |
 | `facade_parsing` | SEEM `threshold`, `backbone`, `prompts`, `label_colors_bgr` |
 | `facade_parsing_segformer` | SegFormer `checkpoint`, `prob_threshold`, `overlay_alpha` |
-| `building_features` | `assumed_door_height_m`, `assumed_floor_height_m`, `window_cluster_tol_ratio`, `plausible_floor_height_m` |
+| `scene_parsing` | `enabled`, Cityscapes `model_id` (b0–b5), `input_long_side`, `min_kept_ratio`, component/edge cleanup (`morph_kernel_px`, `min_component_ratio`, `edge_percentile`), base bracket probe (`base_probe_ratio`) |
+| `building_features` | reference lengths (`assumed_door_height_m`, `assumed_floor_pitch_m`, `assumed_window_height_m`) and their `sigma_rel_*` weights; row clustering (`window_cluster_tol_ratio`, `min_row_members_ratio`, `floor_line_labels`); the vertical model (`max_vertical_scale_ratio`, `max_storeys_above_top_row`, `max_storeys_below_bottom_row`, `min_rows_for_perspective`, `perspective_improvement`); the truncated-door correction (`door_short_storeys`, `door_max_storeys`, `door_base_snap_ratio`); sanity bounds (`plausible_floor_height_m`, `scale_agreement_log_tol`) and the `assumed_floor_height_m` last resort |
 | `building_materials` | `material_backend`, `materials`, `material_properties`, patch/wall knobs (`facade_patch_size`, `facade_min_wall_ratio`, `wall_opening_dilation_ratio`), `facade_checkpoint`, `minc_checkpoint`, SigLIP2 `model_name` |
 
 `main()` in [`src/client.py`](src/client.py) exposes three switches:
@@ -418,6 +587,7 @@ Precise/
 │   ├── facade_parsing/               # Module 1 backend A: SEEM (zero-shot)
 │   ├── facade_parsing_segm/
 │   │   └── segformer_cmp/            # Module 1 backend B: SegFormer on CMP (12 classes)
+│   ├── scene_parsing/                # Module 1b: Cityscapes gate on the facade mask
 │   ├── building_features/            # Module 2: geometry heuristics
 │   ├── building_materials/           # Module 3 backend A: SigLIP2 + shared region sampler
 │   ├── building_materials_minc/      # Module 3 backend B: MINC classifier
