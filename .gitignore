@@ -36,3 +36,6 @@ env/
 Thumbs.db
 *.swp
 .vscode/settings.json
+
+# --- Local secrets (API tokens) ---
+.env
